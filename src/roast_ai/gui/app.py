@@ -1,17 +1,28 @@
+# --- Standard Library Imports ---
 import math
 import os
 import sys
 import threading
+import gc
+
+# --- Third-Party Library Imports ---
 from PIL import Image
 import customtkinter as ctk
 
-# Absolute imports for stability
+# Safe Pygame-ce Import
+try:
+    import pygame
+    PYGAME_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    PYGAME_AVAILABLE = False
+
+# --- Project Imports ---
 from src.roast_ai.gui.status_widget import StatusRing
 from src.roast_ai.api_handler import RiotAPI
 from src.roast_ai.roast_engine import RoastEngine
 
 def resource_path(relative_path):
-    """ PyInstaller helper for assets """
+    """ Get absolute path to resource for local and compiled runs """
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -20,105 +31,140 @@ def resource_path(relative_path):
 
 class RoastApp(ctk.CTk):
     def __init__(self):
+        # 1. INITIALIZE CTk CLASS FIRST (Fixes startup error)
         super().__init__()
+        
+        # 2. AUDIO ENGINE SETUP
+        if PYGAME_AVAILABLE:
+            try:
+                pygame.mixer.init()
+            except Exception as e:
+                print(f"Audio Driver Error: {e}")
+        
+        # 3. CORE ATTRIBUTES
         self.api = RiotAPI()
         self.roaster = RoastEngine()
+        self.volume = 0.5
+        self.is_muted = False
         
-        # Window Configuration
+        # 4. WINDOW CONFIG
         self.title("GG Ai: THE_HUNT")
         self.geometry("1200x800")
         ctk.set_appearance_mode("dark")
         
-        # 🖼️ Layer 0: Background Image (Bottom Layer)
-        bg_path = resource_path("assets/bg.png")
-        if os.path.exists(bg_path):
-            img = Image.open(bg_path)
-            self.bg_image = ctk.CTkImage(light_image=img, dark_image=img, size=(1200, 800))
-            self.bg_label = ctk.CTkLabel(self, image=self.bg_image, text="")
+        # 5. BACKGROUND LAYER
+        bg_p = resource_path("assets/bg.png")
+        if os.path.exists(bg_p):
+            img = ctk.CTkImage(Image.open(bg_p), size=(1200, 800))
+            self.bg_label = ctk.CTkLabel(self, image=img, text="")
             self.bg_label.place(x=0, y=0, relwidth=1, relheight=1)
-        
+
         self.rings = []
         self._setup_ui()
         
-        # ⌨️ Key Binding: Hit 'Enter' to start the hunt
-        self.bind('<Return>', lambda event: self.on_hunt_click())
+        # 6. KEY BINDING
+        self.bind('<Return>', lambda e: self.on_hunt_click())
 
     def _setup_ui(self):
-        # 🕹️ Layer 1: Top-Middle Search Bar
-        # We use relx=0.5 and rely=0.1 to keep it centered at the top
-        self.summoner_entry = ctk.CTkEntry(self, 
-                                            placeholder_text="Enter Riot ID (Name#Tag)", 
-                                            width=500, height=50,
-                                            border_color="#00FFFF", 
-                                            fg_color="#1A1A1A",
-                                            font=("Helvetica", 18, "bold"))
-        self.summoner_entry.place(relx=0.5, rely=0.1, anchor="n")
+        """Builds the UI using relative coordinates to match project layout"""
+        
+        # --- Search Bar (Top-Middle) ---
+        self.entry = ctk.CTkEntry(self, width=500, height=50, 
+                                  placeholder_text="SUMMONER#TAG", 
+                                  border_color="#00FFFF", fg_color="#0D0D0D")
+        self.entry.place(relx=0.5, rely=0.1, anchor="n")
 
-        # 📟 Layer 1: Terminal (Pinned to the Right)
-        # We use relx=0.95 to keep it on the far right edge
+        # --- Audio Cluster (Top-Right) ---
+        self.mute_btn = ctk.CTkButton(self, text="🔊", width=40, height=40,
+                                      fg_color="transparent", border_color="#00FFFF", 
+                                      border_width=1, command=self.toggle_mute)
+        self.mute_btn.place(relx=0.97, rely=0.03, anchor="ne")
+        
+        self.vol_slider = ctk.CTkSlider(self, from_=0, to=1, width=120, command=self.set_volume)
+        self.vol_slider.set(self.volume)
+        self.vol_slider.place(relx=0.92, rely=0.045, anchor="ne")
+
+        # --- Terminal (Pinned Right) ---
         self.terminal = ctk.CTkTextbox(self, width=380, height=550, 
-                                        font=("Courier New", 13),
-                                        fg_color=("#1A1A1A", "#080808"),
-                                        border_color="#00FFFF", border_width=1,
-                                        activate_scrollbars=True)
+                                       fg_color="#080808", border_color="#00FFFF", 
+                                       border_width=1, font=("Courier New", 13))
         self.terminal.place(relx=0.97, rely=0.5, anchor="e")
-        self.write_to_terminal("SYSTEM_ONLINE: READY_FOR_HUNT")
 
-        # ⭕ Layer 1: Central Hextech Button & Rings
-        self.center_container = ctk.CTkFrame(self, fg_color="transparent")
-        self.center_container.place(relx=0.4, rely=0.55, anchor="center")
-        
-        self.hunt_button = ctk.CTkButton(self.center_container, text="INITIATE\nHUNT", 
-                                        width=200, height=200, corner_radius=100,
-                                        fg_color="transparent", border_color="#00FFFF", 
-                                        border_width=2, hover_color="#003333",
-                                        font=("Impact", 26),
-                                        command=self.on_hunt_click)
-        self.hunt_button.pack()
-        
-        self._create_circular_status_rings()
+        # --- Central Button & Rings ---
+        self.hunt_btn = ctk.CTkButton(self, text="INITIATE\nHUNT", 
+                                      width=200, height=200, corner_radius=100, 
+                                      border_color="#00FFFF", border_width=2, 
+                                      fg_color="transparent", font=("Impact", 24), 
+                                      command=self.on_hunt_click)
+        self.hunt_btn.place(relx=0.4, rely=0.55, anchor="center")
 
-    def _create_circular_status_rings(self):
-        """Positions rings around the central button without overlapping"""
+        self._create_rings()
+
+    def _create_rings(self):
+        """Positions pulsing rings around the central button"""
         radius = 170
         for i in range(5):
             angle = math.radians(i * 72 - 90)
-            x_offset = radius * math.cos(angle)
-            y_offset = radius * math.sin(angle)
-            ring = StatusRing(self.center_container)
-            ring.place(relx=0.5, rely=0.5, x=x_offset, y=y_offset, anchor="center")
+            x, y = radius * math.cos(angle), radius * math.sin(angle)
+            ring = StatusRing(self)
+            # Use same relx/rely as button to center the orbit
+            ring.place(relx=0.4, rely=0.55, x=x, y=y, anchor="center")
             self.rings.append(ring)
+
+    def toggle_mute(self):
+        """Switches audio state and updates button visuals"""
+        self.is_muted = not self.is_muted
+        self.mute_btn.configure(text="🔇" if self.is_muted else "🔊", 
+                                border_color="#FF4444" if self.is_muted else "#00FFFF")
+
+    def set_volume(self, v): 
+        self.volume = float(v)
 
     def write_to_terminal(self, msg):
         self.terminal.insert("end", f"> {msg}\n")
         self.terminal.see("end")
 
     def on_hunt_click(self):
-        target = self.summoner_entry.get()
+        """Triggers the search and roasting logic"""
+        target = self.entry.get()
         if "#" not in target:
-            self.write_to_terminal("ERROR: INVALID_FORMAT. USE NAME#TAG")
+            self.write_to_terminal("ERR: INVALID_FORMAT. USE NAME#TAG")
             return
-            
-        self.write_to_terminal(f"HUNT_START: {target}")
+        
+        # UI Status Update
         for r in self.rings: r.set_status("hunting")
-        threading.Thread(target=self._run_hunt_logic, args=(target,), daemon=True).start()
+        
+        # Audio feedback on initiate
+        self._play_feedback()
+        
+        threading.Thread(target=self._run_hunt, args=(target,), daemon=True).start()
 
-    def _run_hunt_logic(self, target):
+    def _play_feedback(self):
+        """Handles audio playback via pygame mixer"""
+        if PYGAME_AVAILABLE and not self.is_muted and self.volume > 0:
+            sound_p = resource_path("assets/sounds/finish.wav")
+            if os.path.exists(sound_p):
+                try:
+                    if not pygame.mixer.get_init(): pygame.mixer.init()
+                    s = pygame.mixer.Sound(sound_p)
+                    s.set_volume(self.volume)
+                    s.play()
+                except: pass
+
+    def _run_hunt(self, target):
+        """Processes target data and retrieves the AI roast"""
         try:
-            self.after(0, lambda: self.write_to_terminal("STEP_1: SCANNING_RIOT_DATA..."))
-            player = self.api.get_summoner_data(target)
-            if "error" in player:
-                self.after(0, lambda: self.write_to_terminal(f"FAIL: {player['error']}"))
-                return
-            
-            self.after(0, lambda: self.write_to_terminal("STEP_2: ANALYZING_MATCHES..."))
-            matches = self.api.get_recent_matches(player.get("puuid"))
+            self.after(0, lambda: self.write_to_terminal(f"HUNT_START: {target}"))
+            data = self.api.get_summoner_data(target)
+            matches = self.api.get_recent_matches(data.get("puuid"))
             
             self.after(0, lambda: [r.set_status("thinking") for r in self.rings])
-            self.after(0, lambda: self.write_to_terminal("STEP_3: GENERATING_AI_ROAST..."))
             roast = self.roaster.generate_roast(target, matches)
             
-            self.after(0, lambda: self.write_to_terminal(f"\nRESULT:\n{roast}\n"))
+            self.after(0, lambda: self.write_to_terminal(f"RESULT: {roast}"))
             self.after(0, lambda: [r.set_status("complete") for r in self.rings])
+            
+            # Memory Cleanup
+            gc.collect() 
         except Exception as e:
             self.after(0, lambda: self.write_to_terminal(f"CRASH: {e}"))
